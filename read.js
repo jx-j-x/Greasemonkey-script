@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         小窗净读器（极简/目录分页/多页拼合）
+// @name         小窗净读器（极简/目录分页/多页拼合/可拖动可调大小）
 // @namespace    https://jx.local/clean-reader
-// @version      0.5.0
-// @description  Alt+L 输入链接→抽正文；Alt+T 打开目录（每页50条，可跳页）；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏；捕获阶段接管方向键；跨域抓取含 GBK；极简无标题无按钮。
+// @version      0.5.2
+// @description  Alt+L 输入链接→抽正文；Alt+T 目录（每页50条，可跳页）；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏；支持拖动与右下角把手调整大小；捕获阶段接管方向键；跨域抓取含 GBK。
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -18,15 +18,28 @@
   // ========== 样式 ==========
   GM_addStyle(`
   #cr-panel{
-    position: fixed; left: 16px; bottom: 16px; width: 300px; height: 400px;
+    position: fixed; left: 16px; bottom: 16px; width: 300px; height: 300px;
     background: #fff; color:#222; border:1px solid #ddd; border-radius:10px;
     box-shadow:0 6px 24px rgba(0,0,0,.15); z-index: 2147483646;
     display:none; overflow:hidden; font:14px/1.7 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   }
-  #cr-content{ height:100%; overflow:auto; padding:12px 14px; }
-  #cr-content p{ margin:0 0 12px 0; }
+  /* 顶部拖拽区（不可见） */
+  #cr-drag{
+    position:absolute; top:0; left:0; right:0; height:10px;
+    cursor:move; z-index:3; background: transparent;
+  }
+  /* 右下角调整大小把手 */
+  #cr-resize{
+    position:absolute; right:2px; bottom:2px; width:14px; height:14px;
+    cursor:nwse-resize; z-index:3; opacity:.7;
+    background:
+      linear-gradient(135deg, rgba(0,0,0,0) 0, rgba(0,0,0,0) 50%, #cfcfcf 50%, #cfcfcf 100%);
+    border-radius:3px;
+  }
+  #cr-content{ height:100%; overflow:auto; padding:12px 14px; position:relative; z-index:1; line-height:1; }
+  #cr-content p{ margin:0 0 6px 0; }
 
-  /* URL 输入弹窗 */
+  /* URL 输入弹窗 & 目录弹窗 */
   #cr-modal, #cr-toc{
     position: fixed; inset: 0; background: rgba(0,0,0,.35); display:none;
     align-items: center; justify-content: center; z-index: 2147483647;
@@ -80,7 +93,11 @@
   // ========== DOM ==========
   const panel = document.createElement('div');
   panel.id = 'cr-panel';
-  panel.innerHTML = `<div id="cr-content"><div style="color:#888">Alt+L 输入链接；Alt+T 打开目录；←/→ 翻页或跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏。</div></div>`;
+  panel.innerHTML = `
+    <div id="cr-drag" title="按住上沿拖动"></div>
+    <div id="cr-resize" title="拖动调整大小"></div>
+    <div id="cr-content"><div style="color:#888">Alt+L 输入链接；Alt+T 打开目录；←/→ 翻页或跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏。可拖动小窗，右下角可调大小。</div></div>
+  `;
   document.documentElement.appendChild(panel);
 
   // URL 弹窗
@@ -128,12 +145,14 @@
   const tocListEl = $('#cr-toc-list', toc);
   const tocRangeEl = $('#cr-toc-range', toc);
   const tocGotoEl = $('#cr-toc-goto', toc);
+  const dragEl = $('#cr-drag', panel);
+  const resizeEl = $('#cr-resize', panel);
 
   // ========== 状态 ==========
   const state = {
     visible: false,
-    modalOpen: false,    // URL弹窗或目录弹窗打开时为 true（屏蔽键盘接管）
-    seriesId: null,      // 当前章节ID（不含 _2）
+    modalOpen: false,    // URL/目录弹窗打开时为 true
+    seriesId: null,
     pages: [],
     pageIndex: 0,
     nextChapterUrl: null,
@@ -141,9 +160,19 @@
     loading: false,
 
     tocUrl: null,
-    tocItems: [],        // [{title, href, id}]
+    tocItems: [],
     tocPage: 0,
     tocPageSize: 50,
+
+    dragging: false,
+    dragDX: 0,
+    dragDY: 0,
+
+    resizing: false,
+    startW: 0,
+    startH: 0,
+    startX: 0,
+    startY: 0,
   };
 
   // ========== 工具 ==========
@@ -162,13 +191,48 @@
       const u = new URL(url);
       const m = u.pathname.match(/^(.*?\/book_\d+\/)/);
       if (m) return new URL(m[1], u.origin).href;
-      // 兜底：去掉文件名
       return new URL(u.pathname.replace(/[^/]+$/, ''), u.origin).href;
     } catch { return null; }
   }
   function chapterIdFromHref(href) {
     try { const m = href.match(/\/(\d+)(?:_(\d+))?\.html$/); return m ? m[1] : null; } catch { return null; }
   }
+
+  const LS_KEY = 'cr_reader_panel_state';
+  function savePanelState() {
+    const rect = panel.getBoundingClientRect();
+    const data = { x: rect.left, y: rect.top, w: rect.width, h: rect.height };
+    try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch {}
+  }
+  function restorePanelState() {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const { x, y, w, h } = JSON.parse(raw);
+      if (Number.isFinite(x) && Number.isFinite(y)) {
+        panel.style.top = Math.max(2, Math.min(y, window.innerHeight - 50)) + 'px';
+        panel.style.left = Math.max(2, Math.min(x, window.innerWidth - 50)) + 'px';
+        panel.style.bottom = ''; panel.style.right = '';
+      }
+      if (Number.isFinite(w) && Number.isFinite(h)) {
+        const cw = Math.max(220, Math.min(w, window.innerWidth - 10));
+        const ch = Math.max(160, Math.min(h, window.innerHeight - 10));
+        panel.style.width = cw + 'px';
+        panel.style.height = ch + 'px';
+      }
+    } catch {}
+  }
+  function clampIntoViewport() {
+    const rect = panel.getBoundingClientRect();
+    let x = rect.left, y = rect.top, w = rect.width, h = rect.height;
+    const maxX = window.innerWidth - w - 2;
+    const maxY = window.innerHeight - h - 2;
+    x = Math.max(2, Math.min(x, Math.max(2, maxX)));
+    y = Math.max(2, Math.min(y, Math.max(2, maxY)));
+    panel.style.left = x + 'px';
+    panel.style.top = y + 'px';
+  }
+  window.addEventListener('resize', () => { clampIntoViewport(); savePanelState(); });
 
   function decodeText(arrayBuffer, headersStr) {
     const lower = (headersStr || '').toLowerCase();
@@ -243,7 +307,6 @@
   function getInfoUrl(doc, baseUrl, entryUrl) {
     const el = doc.querySelector('#info_url');
     if (el) return absolutize(baseUrl, el.getAttribute('href') || '');
-    // 兜底：按 book_xxx/ 目录推断
     const derived = deriveBookBase(entryUrl);
     return derived;
   }
@@ -261,7 +324,6 @@
     try {
       const first = await gmFetch(entryUrl);
       const firstDoc = parseHTML(first.html);
-      // 目录 URL 记下来
       state.tocUrl = getInfoUrl(firstDoc, entryUrl, entryUrl);
 
       const { prev: prev0, next: next0 } = getNavUrls(firstDoc, entryUrl);
@@ -270,7 +332,6 @@
       state.pages.push({ url: entryUrl, html: extractMain(firstDoc, entryUrl) });
       visited.add(new URL(entryUrl, location.href).href);
 
-      // 连抓分页
       let cursor = next0, step = 0;
       while (cursor && isSameChapterPage(cursor, entryUrl) && step < 50) {
         const abs = new URL(cursor, entryUrl).href;
@@ -309,7 +370,6 @@
       tocListEl.innerHTML = `<div style="padding:8px;color:#666">正在加载目录…</div>`;
       let tocUrl = state.tocUrl;
       if (!tocUrl) {
-        // 若没有章节上下文，尝试用当前页推断
         tocUrl = deriveBookBase(location.href);
         state.tocUrl = tocUrl;
       }
@@ -326,7 +386,6 @@
         tocRangeEl.textContent = '—';
       }
     } else {
-      // 已有目录，直接渲染（定位到当前章节所在页）
       state.tocPage = clampTocPageToCurrent(state.tocItems);
       renderTOC();
     }
@@ -344,7 +403,6 @@
   }
 
   function collectTOCItems(doc, baseUrl) {
-    // 规则：收集所有 href 指向本书目录下 /book_<id>/数字.html 的链接
     const bookBase = deriveBookBase(baseUrl) || '';
     const anchors = Array.from(doc.querySelectorAll('a'));
     const out = [];
@@ -355,7 +413,7 @@
       if (!raw) return;
       const abs = absolutize(baseUrl, raw);
       if (!abs.startsWith(bookBase)) return;
-      if (!/\/\d+(?:_\d+)?\.html(?:[#?].*)?$/.test(abs)) return; // 必须是具体章节页
+      if (!/\/\d+(?:_\d+)?\.html(?:[#?].*)?$/.test(abs)) return;
       if (seen.has(abs)) return;
       seen.add(abs);
       const title = (a.textContent || a.getAttribute('title') || '').trim().replace(/\s+/g,' ');
@@ -363,11 +421,8 @@
       out.push({ title: title || (id ? `章节 ${id}` : abs), href: abs, id });
     });
 
-    // 有些目录页会包含前后推荐或公告，过滤可能的“回目录/上一页/下一页”等文案
     const blacklist = /(上一[页章]|下一[页章]|返回|顶|底|最新|目录)/;
-    const filtered = out.filter(it => !blacklist.test(it.title));
-
-    return filtered;
+    return out.filter(it => !blacklist.test(it.title));
   }
 
   function renderTOC() {
@@ -378,7 +433,6 @@
     const end = Math.min(start + size, total);
     const slice = state.tocItems.slice(start, end);
 
-    // 列表
     tocListEl.innerHTML = slice.map((it, i) => {
       const idx = start + i + 1;
       const active = (it.id && state.seriesId && it.id === state.seriesId) ? ' active' : '';
@@ -390,15 +444,12 @@
       `;
     }).join('') || `<div style="padding:8px;color:#666">目录为空</div>`;
 
-    // 区间显示：形如 “1-50”
     tocRangeEl.textContent = total ? `${start+1}-${end}` : '—';
 
-    // 页码输入最大值提示
     const maxPage = Math.max(1, Math.ceil(total / size));
     tocGotoEl.setAttribute('max', String(maxPage));
     tocGotoEl.setAttribute('placeholder', `1~${maxPage}`);
 
-    // 事件绑定
     tocListEl.querySelectorAll('.toc-item').forEach(el => {
       el.addEventListener('click', () => {
         const href = el.getAttribute('data-href');
@@ -437,7 +488,11 @@
   }
 
   // ========== 面板显示/隐藏 ==========
-  function showPanel(){ state.visible = true; panel.style.display = 'block'; }
+  function showPanel(){
+    state.visible = true; panel.style.display = 'block';
+    // 恢复位置尺寸（第一次显示时）
+    restorePanelState(); clampIntoViewport();
+  }
   function hidePanel(){ state.visible = false; panel.style.display = 'none'; }
   function togglePanel(){ state.visible ? hidePanel() : showPanel(); }
 
@@ -481,15 +536,13 @@
     let p = parseInt(tocGotoEl.value, 10);
     if (!isFinite(p) || p < 1) p = 1;
     if (p > maxPage) p = maxPage;
-    state.tocPage = p - 1; // 输入为 1 基
+    state.tocPage = p - 1;
     renderTOC();
   });
   tocGotoEl.addEventListener('keydown', (e) => {
     if (e.key === 'Enter') { e.preventDefault(); $('#cr-toc-go', toc).click(); }
     if (e.key === 'Escape') { e.preventDefault(); closeTOC(); }
   });
-
-  // 支持 PageUp/PageDown 快捷页翻
   toc.addEventListener('keydown', (e) => {
     if (!state.modalOpen) return;
     if (e.key === 'PageDown') { e.preventDefault(); $('#cr-toc-next', toc).click(); }
@@ -497,34 +550,89 @@
     if (e.key === 'Escape')   { e.preventDefault(); closeTOC(); }
   });
 
+  // ========== 拖动 ==========
+  function startDrag(e){
+    state.dragging = true;
+    const rect = panel.getBoundingClientRect();
+    state.dragDX = e.clientX - rect.left;
+    state.dragDY = e.clientY - rect.top;
+    panel.style.top = rect.top + 'px';
+    panel.style.left = rect.left + 'px';
+    panel.style.bottom = ''; panel.style.right = '';
+    document.addEventListener('mousemove', onDragMove, true);
+    document.addEventListener('mouseup', endDrag, true);
+    e.preventDefault(); e.stopPropagation();
+  }
+  function onDragMove(e){
+    if (!state.dragging) return;
+    const w = panel.offsetWidth, h = panel.offsetHeight;
+    let nx = e.clientX - state.dragDX;
+    let ny = e.clientY - state.dragDY;
+    const maxX = window.innerWidth - w - 2;
+    const maxY = window.innerHeight - h - 2;
+    nx = Math.max(2, Math.min(nx, maxX));
+    ny = Math.max(2, Math.min(ny, maxY));
+    panel.style.left = nx + 'px';
+    panel.style.top  = ny + 'px';
+  }
+  function endDrag(){
+    state.dragging = false;
+    document.removeEventListener('mousemove', onDragMove, true);
+    document.removeEventListener('mouseup', endDrag, true);
+    savePanelState();
+  }
+  dragEl.addEventListener('mousedown', startDrag, true);
+
+  // ========== 调整大小 ==========
+  function startResize(e){
+    state.resizing = true;
+    const rect = panel.getBoundingClientRect();
+    state.startW = rect.width;
+    state.startH = rect.height;
+    state.startX = e.clientX;
+    state.startY = e.clientY;
+    // 固定当前 left/top，防止 bottom/right 影响
+    panel.style.top = rect.top + 'px';
+    panel.style.left = rect.left + 'px';
+    panel.style.bottom = ''; panel.style.right = '';
+    document.addEventListener('mousemove', onResizeMove, true);
+    document.addEventListener('mouseup', endResize, true);
+    e.preventDefault(); e.stopPropagation();
+  }
+  function onResizeMove(e){
+    if (!state.resizing) return;
+    const dx = e.clientX - state.startX;
+    const dy = e.clientY - state.startY;
+    let w = state.startW + dx;
+    let h = state.startH + dy;
+    const minW = 220, minH = 160;
+    const maxW = Math.min(window.innerWidth - 10, 900);
+    const maxH = Math.min(window.innerHeight - 10, 900);
+    w = Math.max(minW, Math.min(w, maxW));
+    h = Math.max(minH, Math.min(h, maxH));
+    panel.style.width  = w + 'px';
+    panel.style.height = h + 'px';
+    clampIntoViewport();
+  }
+  function endResize(){
+    state.resizing = false;
+    document.removeEventListener('mousemove', onResizeMove, true);
+    document.removeEventListener('mouseup', endResize, true);
+    savePanelState();
+  }
+  resizeEl.addEventListener('mousedown', startResize, true);
+
   // ========== 键盘捕获（仅面板可见且无弹窗时） ==========
   const SCROLL_STEP = 80;
   function handleKey(e) {
-    // Alt+L：打开链接输入
-    if (e.altKey && (e.key === 'l' || e.key === 'L')) {
-      e.preventDefault(); e.stopPropagation();
-      openUrlModal(location.href);
-      return;
-    }
-    // Alt+T：打开目录
-    if (e.altKey && (e.key === 't' || e.key === 'T')) {
-      e.preventDefault(); e.stopPropagation();
-      openTOC();
-      return;
-    }
-    // Ctrl+Alt+X：显示/隐藏面板
-    if (e.ctrlKey && e.altKey && (e.key === 'x' || e.key === 'X')) {
-      e.preventDefault(); e.stopPropagation();
-      togglePanel(); return;
-    }
+    if (e.altKey && (e.key === 'l' || e.key === 'L')) { e.preventDefault(); e.stopPropagation(); openUrlModal(location.href); return; }
+    if (e.altKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); e.stopPropagation(); openTOC(); return; }
+    if (e.ctrlKey && e.altKey && (e.key === 'x' || e.key === 'X')) { e.preventDefault(); e.stopPropagation(); togglePanel(); return; }
 
-    // 弹窗打开时不拦截其它键
     if (state.modalOpen) return;
-
     if (!state.visible) return;
     if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) return;
 
-    // 捕获阶段阻断站点热键
     e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
 
     if (e.key === 'ArrowUp') {
@@ -559,5 +667,6 @@
   // ========== 辅助 ==========
   function renderInfo(msg) { contentEl.innerHTML = `<div style="color:#666;font-size:12px">${msg}</div>`; }
 
-  // 默认不显示；Alt+L / Alt+T 呼出
+  // 首次尝试恢复（用户可能用 Ctrl+Alt+X 显示/隐藏，故也在 showPanel 再次兜底恢复）
+  restorePanelState();
 })();
