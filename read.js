@@ -1,8 +1,8 @@
 // ==UserScript==
-// @name         小窗净读器（极简/目录分页/多页拼合/可拖动可调大小）
-// @namespace    https://jx.local/clean-reader
-// @version      0.5.2
-// @description  Alt+L 输入链接→抽正文；Alt+T 目录（每页50条，可跳页）；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏；支持拖动与右下角把手调整大小；捕获阶段接管方向键；跨域抓取含 GBK。
+// @name         小窗净读器（极简/目录分页/多页拼合/可拖动可调大小/记忆进度）
+// @namespace    https://github.com/jx-j-x/Greasemonkey-script
+// @version      0.5.3
+// @description  Alt+L 输入链接→抽正文；Alt+T 目录（每页50条，可跳页）；Alt+R 续读上次；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏；拖动+右下角把手可调大小；跨域抓取含 GBK；自动记忆目录与最后章节链接。
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
@@ -96,7 +96,7 @@
   panel.innerHTML = `
     <div id="cr-drag" title="按住上沿拖动"></div>
     <div id="cr-resize" title="拖动调整大小"></div>
-    <div id="cr-content"><div style="color:#888">Alt+L 输入链接；Alt+T 打开目录；←/→ 翻页或跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏。可拖动小窗，右下角可调大小。</div></div>
+    <div id="cr-content"><div style="color:#888">Alt+L 输入链接；Alt+T 目录；Alt+R 续读上次；←/→ 翻页或跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏。可拖动小窗，右下角可调大小。</div></div>
   `;
   document.documentElement.appendChild(panel);
 
@@ -151,7 +151,7 @@
   // ========== 状态 ==========
   const state = {
     visible: false,
-    modalOpen: false,    // URL/目录弹窗打开时为 true
+    modalOpen: false,
     seriesId: null,
     pages: [],
     pageIndex: 0,
@@ -198,15 +198,19 @@
     try { const m = href.match(/\/(\d+)(?:_(\d+))?\.html$/); return m ? m[1] : null; } catch { return null; }
   }
 
-  const LS_KEY = 'cr_reader_panel_state';
+  // —— 面板位置尺寸本地存储
+  const LS_KEY_PANEL = 'cr_reader_panel_state';
+  // —— 阅读进度本地存储（目录 & 最后章节）
+  const LS_KEY_PROGRESS = 'cr_reader_progress';
+
   function savePanelState() {
     const rect = panel.getBoundingClientRect();
     const data = { x: rect.left, y: rect.top, w: rect.width, h: rect.height };
-    try { localStorage.setItem(LS_KEY, JSON.stringify(data)); } catch {}
+    try { localStorage.setItem(LS_KEY_PANEL, JSON.stringify(data)); } catch {}
   }
   function restorePanelState() {
     try {
-      const raw = localStorage.getItem(LS_KEY);
+      const raw = localStorage.getItem(LS_KEY_PANEL);
       if (!raw) return;
       const { x, y, w, h } = JSON.parse(raw);
       if (Number.isFinite(x) && Number.isFinite(y)) {
@@ -233,6 +237,28 @@
     panel.style.top = y + 'px';
   }
   window.addEventListener('resize', () => { clampIntoViewport(); savePanelState(); });
+
+  // —— 阅读进度：保存/恢复
+  function saveProgress({ tocUrl, chapterUrl, seriesId }) {
+    const bookBase = deriveBookBase(tocUrl || chapterUrl) || '';
+    const payload = {
+      tocUrl: tocUrl || null,
+      chapterUrl: chapterUrl || null,
+      seriesId: seriesId || null,
+      bookBase,
+      updatedAt: Date.now()
+    };
+    try { localStorage.setItem(LS_KEY_PROGRESS, JSON.stringify(payload)); } catch {}
+  }
+  function getSavedProgress() {
+    try {
+      const raw = localStorage.getItem(LS_KEY_PROGRESS);
+      if (!raw) return null;
+      const o = JSON.parse(raw);
+      if (!o || (!o.tocUrl && !o.chapterUrl)) return null;
+      return o;
+    } catch { return null; }
+  }
 
   function decodeText(arrayBuffer, headersStr) {
     const lower = (headersStr || '').toLowerCase();
@@ -324,7 +350,12 @@
     try {
       const first = await gmFetch(entryUrl);
       const firstDoc = parseHTML(first.html);
+
+      // 目录 URL
       state.tocUrl = getInfoUrl(firstDoc, entryUrl, entryUrl);
+
+      // 保存进度（目录 + 当前章节）
+      saveProgress({ tocUrl: state.tocUrl, chapterUrl: entryUrl, seriesId: state.seriesId });
 
       const { prev: prev0, next: next0 } = getNavUrls(firstDoc, entryUrl);
       state.prevChapterUrl = (prev0 && !isSameChapterPage(prev0, entryUrl)) ? prev0 : null;
@@ -332,6 +363,7 @@
       state.pages.push({ url: entryUrl, html: extractMain(firstDoc, entryUrl) });
       visited.add(new URL(entryUrl, location.href).href);
 
+      // 连抓分页
       let cursor = next0, step = 0;
       while (cursor && isSameChapterPage(cursor, entryUrl) && step < 50) {
         const abs = new URL(cursor, entryUrl).href;
@@ -366,10 +398,18 @@
     state.modalOpen = true;
     toc.style.display = 'flex';
     $('#cr-toc-goto').value = '';
+
+    // 优先使用记忆目录
+    if (!state.tocUrl) {
+      const saved = getSavedProgress();
+      if (saved && saved.tocUrl) state.tocUrl = saved.tocUrl;
+    }
+
     if (!state.tocItems.length) {
       tocListEl.innerHTML = `<div style="padding:8px;color:#666">正在加载目录…</div>`;
       let tocUrl = state.tocUrl;
       if (!tocUrl) {
+        // 若仍无记忆目录，则按当前页推断
         tocUrl = deriveBookBase(location.href);
         state.tocUrl = tocUrl;
       }
@@ -490,7 +530,6 @@
   // ========== 面板显示/隐藏 ==========
   function showPanel(){
     state.visible = true; panel.style.display = 'block';
-    // 恢复位置尺寸（第一次显示时）
     restorePanelState(); clampIntoViewport();
   }
   function hidePanel(){ state.visible = false; panel.style.display = 'none'; }
@@ -501,7 +540,11 @@
     state.modalOpen = true;
     showPanel();
     modal.style.display = 'flex';
-    urlInput.value = defaultUrl || location.href;
+
+    // 默认填入「上次章节」> 传入默认 > 当前页
+    const saved = getSavedProgress();
+    urlInput.value = (saved && saved.chapterUrl) || defaultUrl || location.href;
+
     urlInput.focus(); urlInput.select();
   }
   function closeUrlModal() { state.modalOpen = false; modal.style.display = 'none'; }
@@ -591,7 +634,6 @@
     state.startH = rect.height;
     state.startX = e.clientX;
     state.startY = e.clientY;
-    // 固定当前 left/top，防止 bottom/right 影响
     panel.style.top = rect.top + 'px';
     panel.style.left = rect.left + 'px';
     panel.style.bottom = ''; panel.style.right = '';
@@ -625,14 +667,26 @@
   // ========== 键盘捕获（仅面板可见且无弹窗时） ==========
   const SCROLL_STEP = 80;
   function handleKey(e) {
+    // Alt+L：输入链接
     if (e.altKey && (e.key === 'l' || e.key === 'L')) { e.preventDefault(); e.stopPropagation(); openUrlModal(location.href); return; }
+    // Alt+T：目录（优先使用记忆目录）
     if (e.altKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); e.stopPropagation(); openTOC(); return; }
+    // Alt+R：续读上次章节
+    if (e.altKey && (e.key === 'r' || e.key === 'R')) {
+      e.preventDefault(); e.stopPropagation();
+      const saved = getSavedProgress();
+      if (saved && saved.chapterUrl) { showPanel(); fetchChapterSeries(saved.chapterUrl); }
+      else { openUrlModal(location.href); }
+      return;
+    }
+    // Ctrl+Alt+X：显示/隐藏面板
     if (e.ctrlKey && e.altKey && (e.key === 'x' || e.key === 'X')) { e.preventDefault(); e.stopPropagation(); togglePanel(); return; }
 
     if (state.modalOpen) return;
     if (!state.visible) return;
     if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) return;
 
+    // 捕获方向键
     e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
 
     if (e.key === 'ArrowUp') {
@@ -667,6 +721,6 @@
   // ========== 辅助 ==========
   function renderInfo(msg) { contentEl.innerHTML = `<div style="color:#666;font-size:12px">${msg}</div>`; }
 
-  // 首次尝试恢复（用户可能用 Ctrl+Alt+X 显示/隐藏，故也在 showPanel 再次兜底恢复）
+  // 首次尝试恢复（面板位置 & 记忆目录仅在使用时读取）
   restorePanelState();
 })();
