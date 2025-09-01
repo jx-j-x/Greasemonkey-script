@@ -1,14 +1,17 @@
 // ==UserScript==
-// @name         小窗净读器（极简/目录分页/多页拼合/可拖动可调大小/记忆进度）
+// @name         小窗净读器（通用适配/目录分页/多页拼合/可拖可调/记忆进度/可扩展）
 // @namespace    https://github.com/jx-j-x/Greasemonkey-script
-// @version      0.5.3
-// @description  Alt+L 输入链接→抽正文；Alt+T 目录（每页50条，可跳页）；Alt+R 续读上次；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏；拖动+右下角把手可调大小；跨域抓取含 GBK；自动记忆目录与最后章节链接。
+// @version      0.6.2
+// @description  Alt+L 输入链接→抽正文；Alt+T 目录（每页50条，可跳页）；Alt+R 续读上次；←/→ 翻页/跳章；↑/↓ 平滑滚动；Ctrl+Alt+X 显示/隐藏。多站点适配可扩展，跨域抓取（含 GBK/Big5），小窗可拖动/调整大小，自动记忆目录与最后章节链接。
 // @match        *://*/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_addStyle
 // @connect      *
 // @connect      3wwd.com
 // @connect      m.3wwd.com
+// @connect      biquge.tw
+// @connect      www.biquge.tw
+// @connect      m.biquge.tw
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -23,20 +26,13 @@
     box-shadow:0 6px 24px rgba(0,0,0,.15); z-index: 2147483646;
     display:none; overflow:hidden; font:14px/1.7 -apple-system,BlinkMacSystemFont,Segoe UI,Roboto,Helvetica,Arial,"Noto Sans","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;
   }
-  /* 顶部拖拽区（不可见） */
-  #cr-drag{
-    position:absolute; top:0; left:0; right:0; height:10px;
-    cursor:move; z-index:3; background: transparent;
-  }
-  /* 右下角调整大小把手 */
+  #cr-drag{ position:absolute; top:0; left:0; right:0; height:10px; cursor:move; z-index:3; }
   #cr-resize{
-    position:absolute; right:2px; bottom:2px; width:14px; height:14px;
-    cursor:nwse-resize; z-index:3; opacity:.7;
-    background:
-      linear-gradient(135deg, rgba(0,0,0,0) 0, rgba(0,0,0,0) 50%, #cfcfcf 50%, #cfcfcf 100%);
+    position:absolute; right:2px; bottom:2px; width:14px; height:14px; cursor:nwse-resize; z-index:3; opacity:.7;
+    background:linear-gradient(135deg, rgba(0,0,0,0) 0, rgba(0,0,0,0) 50%, #cfcfcf 50%, #cfcfcf 100%);
     border-radius:3px;
   }
-  #cr-content{ height:100%; overflow:auto; padding:12px 14px; position:relative; z-index:1; line-height:1; }
+  #cr-content{ height:100%; overflow:auto; padding:12px 14px; position:relative; z-index:1; }
   #cr-content p{ margin:0 0 6px 0; }
 
   /* URL 输入弹窗 & 目录弹窗 */
@@ -45,7 +41,7 @@
     align-items: center; justify-content: center; z-index: 2147483647;
   }
   #cr-modal .cr-box, #cr-toc .cr-box{
-    width: min(720px, 94vw); background:#fff; border-radius:12px;
+    width: min(800px, 96vw); background:#fff; border-radius:12px;
     box-shadow: 0 10px 30px rgba(0,0,0,.25); padding: 16px;
   }
   #cr-modal h3, #cr-toc h3{ margin:0 0 10px 0; font-size:16px; }
@@ -73,7 +69,7 @@
   }
   .toc-item:hover{ background:#f6f6f6; }
   .toc-item.active{ background:#111; color:#fff; }
-  .toc-idx{ min-width: 48px; opacity:.7; font-variant-numeric: tabular-nums; }
+  .toc-idx{ min-width: 56px; opacity:.7; font-variant-numeric: tabular-nums; }
   .toc-title{ flex:1; word-break: break-all; }
 
   .cr-toc-foot{
@@ -86,7 +82,7 @@
     border:1px solid #ddd; background:#fff; border-radius:8px; padding:6px 10px; cursor:pointer;
   }
   .pager input{
-    width:80px; padding:6px 8px; border:1px solid #ddd; border-radius:8px; outline:none; font-size:14px;
+    width:90px; padding:6px 8px; border:1px solid #ddd; border-radius:8px; outline:none; font-size:14px;
   }
   `);
 
@@ -100,7 +96,6 @@
   `;
   document.documentElement.appendChild(panel);
 
-  // URL 弹窗
   const modal = document.createElement('div');
   modal.id = 'cr-modal';
   modal.innerHTML = `
@@ -115,7 +110,6 @@
   `;
   document.documentElement.appendChild(modal);
 
-  // 目录弹窗
   const toc = document.createElement('div');
   toc.id = 'cr-toc';
   toc.innerHTML = `
@@ -159,20 +153,124 @@
     prevChapterUrl: null,
     loading: false,
 
+    profile: null,          // 当前命中的站点 profile
+    bookBase: null,         // 当前书籍基准路径
     tocUrl: null,
     tocItems: [],
     tocPage: 0,
     tocPageSize: 50,
 
-    dragging: false,
-    dragDX: 0,
-    dragDY: 0,
+    dragging: false, dragDX: 0, dragDY: 0,
+    resizing: false, startW: 0, startH: 0, startX: 0, startY: 0,
+  };
 
-    resizing: false,
-    startW: 0,
-    startH: 0,
-    startX: 0,
-    startY: 0,
+  // ========== Profiles（站点适配表） ==========
+  const PROFILES = [
+    // --- 3wwd.com ---
+    {
+      id: '3wwd',
+      test: (url) => /(^|\.)3wwd\.com$/i.test(new URL(url).hostname),
+      deriveBookBase: (url) => {
+        const u = new URL(url);
+        const m = u.pathname.match(/^(.*?\/book_\d+\/)/);
+        if (m) return new URL(m[1], u.origin).href;
+        return generic.deriveBookBase(url);
+      },
+      tocContainers: ['#list', '.box_con #list'],
+      isChapterLink: (abs, bookBase) => sameBook(abs, bookBase) && /\/\d+(?:_\d+)?\.html(?:[#?].*)?$/i.test(abs),
+      extractContent: (doc, baseUrl) => preferFirst(doc, [
+        '#content', '#chaptercontent', '#chapterContent', '.content', '.read-content', '#contentTxt', '#BookText', '#txtContent'
+      ], baseUrl),
+      findInfoUrl: (doc, baseUrl, entry) => {
+        const el = doc.querySelector('#info_url');
+        if (el) return absolutize(baseUrl, el.getAttribute('href') || '');
+        return generic.findInfoUrl(doc, baseUrl, entry);
+      },
+      findNav: (doc, baseUrl) => generic.findNav(doc, baseUrl),
+    },
+
+    // --- biquge.tw / www.biquge.tw / m.biquge.tw ---
+    {
+      id: 'biquge-tw',
+      test: (url) => /(^|\.)(biquge\.tw)$/i.test(new URL(url).hostname.replace(/^www\./,'')),
+      deriveBookBase: (url) => {
+        const u = new URL(url);
+        const m = u.pathname.match(/^(.*?\/book\/\d+\/)/);
+        if (m) return new URL(m[1], u.origin).href; // 形如 https://www.biquge.tw/book/2319336/
+        return generic.deriveBookBase(url);
+      },
+      tocContainers: ['#list', '.listmain', '#chapterlist', '.chapterlist', '#listmain', '#chapters', '.chapters'],
+      isChapterLink: (abs, bookBase) => sameBook(abs, bookBase) && /\/book\/\d+\/\d+(?:_\d+)?\.html(?:[#?].*)?$/i.test(abs),
+      extractContent: (doc, baseUrl) => preferFirst(doc, [
+        '#content', '#chaptercontent', '#chapterContent', '.content', '.read-content', '#contentTxt', '#BookText', '#txtContent'
+      ], baseUrl),
+      findInfoUrl: (doc, baseUrl, entry) => {
+        // biquge.tw 正文页一般没有明确“目录”按钮，直接回落到书籍根
+        return generic.deriveBookBase(entry);
+      },
+      findNav: (doc, baseUrl) => generic.findNav(doc, baseUrl),
+      tocCandidates: (base) => {
+        // biquge 常见目录页：/book/<id>/、/book/<id>/index.html、也有 all.html
+        const out = [];
+        const b = base.replace(/\/?$/,'/');
+        out.push(b);
+        out.push(b + 'index.html');
+        out.push(b + 'all.html');
+        try {
+          const u = new URL(b);
+          if (u.hostname.startsWith('www.')) {
+            const mu = new URL(b); mu.hostname = 'm.' + u.hostname.slice(4); out.push(mu.href); out.push(mu.href + 'index.html');
+          } else if (u.hostname.startsWith('m.')) {
+            const wu = new URL(b); wu.hostname = 'www.' + u.hostname.slice(2); out.push(wu.href); out.push(wu.href + 'index.html');
+          }
+        } catch {}
+        return Array.from(new Set(out));
+      }
+    },
+
+    // --- 通用兜底（最后一项） ---
+    {
+      id: 'generic',
+      test: (_url) => true,
+      deriveBookBase: (url) => generic.deriveBookBase(url),
+      tocContainers: ['#list', '.listmain', '#listmain', '#chapterlist', '.chapterlist', '#chapters', '.chapters', '.volume', '.mulu'],
+      isChapterLink: (abs, bookBase) => sameBook(abs, bookBase) && /\/\d+(?:_\d+)?\.html(?:[#?].*)?$/i.test(abs),
+      extractContent: (doc, baseUrl) => preferFirst(doc, [
+        '#content', '#chaptercontent', '#chapterContent', '.content', '.read-content', '#contentTxt', '#BookText', '#txtContent'
+      ], baseUrl),
+      findInfoUrl: (doc, baseUrl, entry) => generic.findInfoUrl(doc, baseUrl, entry),
+      findNav: (doc, baseUrl) => generic.findNav(doc, baseUrl)
+    }
+  ];
+
+  // ========== 通用实现 ==========
+  const generic = {
+    deriveBookBase(url) {
+      try {
+        const u = new URL(url);
+        const m1 = u.pathname.match(/^(.*?\/book_\d+\/)/);
+        if (m1) return new URL(m1[1], u.origin).href;
+        const m2 = u.pathname.match(/^(.*?\/book\/\d+\/)/);
+        if (m2) return new URL(m2[1], u.origin).href;
+        const p = u.pathname.endsWith('/') ? u.pathname : u.pathname.replace(/[^/]+$/, '');
+        return new URL(p, u.origin).href;
+      } catch { return null; }
+    },
+    findInfoUrl(doc, baseUrl, entryUrl) {
+      const el = doc.querySelector('#info_url');
+      if (el) return absolutize(baseUrl, el.getAttribute('href') || '');
+      const hint = Array.from(doc.querySelectorAll('a')).find(a => /(目录|章节目录|返回书页|返回目录)/.test((a.textContent || '').trim()));
+      if (hint) return absolutize(baseUrl, hint.getAttribute('href') || '');
+      return generic.deriveBookBase(entryUrl);
+    },
+    findNav(doc, baseUrl) {
+      const norm = (u)=>u ? absolutize(baseUrl, u) : null;
+      let prev = safeHref(doc.querySelector('#prev_url')?.getAttribute('href') || '');
+      let next = safeHref(doc.querySelector('#next_url')?.getAttribute('href') || '');
+      if (!prev) { const c = Array.from(doc.querySelectorAll('a')).find(a => /上[一页一章]/.test((a.textContent || '').trim())); if (c) prev = safeHref(c.getAttribute('href') || ''); }
+      if (!next) { const anchors = Array.from(doc.querySelectorAll('a')); const c = anchors.reverse().find(a => /下[一页一章]/.test((a.textContent || '').trim())); if (c) next = safeHref(c.getAttribute('href') || ''); }
+      return { prev: prev ? norm(prev) : null, next: next ? norm(next) : null };
+    }
   };
 
   // ========== 工具 ==========
@@ -186,21 +284,48 @@
   }
   function getSeriesIdFromUrl(url) { try { const m = new URL(url).pathname.match(/(\d+)(?:_(\d+))?\.html$/); return m ? m[1] : null; } catch { return null; } }
   function isSameChapterPage(u1, u2) { const a = getSeriesIdFromUrl(u1), b = getSeriesIdFromUrl(u2); return a && b && a === b; }
-  function deriveBookBase(url) {
+  function sameBook(hrefAbs, bookBase) {
     try {
-      const u = new URL(url);
-      const m = u.pathname.match(/^(.*?\/book_\d+\/)/);
-      if (m) return new URL(m[1], u.origin).href;
-      return new URL(u.pathname.replace(/[^/]+$/, ''), u.origin).href;
-    } catch { return null; }
+      const u = new URL(hrefAbs), b = new URL(bookBase);
+      return u.origin === b.origin && u.pathname.startsWith(b.pathname);
+    } catch { return false; }
   }
   function chapterIdFromHref(href) {
-    try { const m = href.match(/\/(\d+)(?:_(\d+))?\.html$/); return m ? m[1] : null; } catch { return null; }
+    try { const m = href.match(/\/(\d+)(?:_\d+)?\.html/); return m ? m[1] : null; } catch { return null; }
+  }
+  function chooseProfile(url) {
+    for (const p of PROFILES) { try { if (p.test(url)) return p; } catch {} }
+    return PROFILES[PROFILES.length-1];
+  }
+  function preferFirst(doc, selList, baseUrl) {
+    for (const sel of selList) {
+      const node = doc.querySelector(sel);
+      if (node) return cleanContentNode(node, baseUrl);
+    }
+    const body = doc.body.cloneNode(true);
+    try { body.querySelectorAll('script,style,ins,.adsbygoogle,.ad,[class*="ad-"],.advert,[id^="hm_t_"],.recommend,.toolbar').forEach(e=>e.remove()); } catch {}
+    const txt = (body.textContent || '').trim().replace(/\n{2,}/g,'</p><p>');
+    return txt ? `<p>${txt}</p>` : '<p>（未找到正文容器）</p>';
+  }
+  function cleanContentNode(node, baseUrl) {
+    const n = node.cloneNode(true);
+    try { n.querySelectorAll('script,style,ins,.adsbygoogle,.ad,[class*="ad-"],.advert,[id^="hm_t_"],.recommend,.toolbar').forEach(e=>e.remove()); } catch {}
+    n.querySelectorAll('img').forEach(img => {
+      const src = img.getAttribute('src') || '';
+      try { img.src = new URL(src, baseUrl).href; } catch { img.src = src; }
+      img.style.maxWidth = '100%';
+    });
+    n.querySelectorAll('a').forEach(a => {
+      const href = safeHref(a.getAttribute('href') || '');
+      if (!href) { a.removeAttribute('href'); return; }
+      try { a.href = new URL(href, baseUrl).href; } catch { a.href = href; }
+      a.rel = 'noreferrer noopener';
+    });
+    return n.innerHTML || '<p>（正文为空）</p>';
   }
 
-  // —— 面板位置尺寸本地存储
+  // ========== 存储 ==========
   const LS_KEY_PANEL = 'cr_reader_panel_state';
-  // —— 阅读进度本地存储（目录 & 最后章节）
   const LS_KEY_PROGRESS = 'cr_reader_progress';
 
   function savePanelState() {
@@ -238,15 +363,11 @@
   }
   window.addEventListener('resize', () => { clampIntoViewport(); savePanelState(); });
 
-  // —— 阅读进度：保存/恢复
   function saveProgress({ tocUrl, chapterUrl, seriesId }) {
-    const bookBase = deriveBookBase(tocUrl || chapterUrl) || '';
+    const bookBase = (state.profile?.deriveBookBase?.(tocUrl || chapterUrl)) || generic.deriveBookBase(tocUrl || chapterUrl) || '';
     const payload = {
-      tocUrl: tocUrl || null,
-      chapterUrl: chapterUrl || null,
-      seriesId: seriesId || null,
-      bookBase,
-      updatedAt: Date.now()
+      tocUrl: tocUrl || null, chapterUrl: chapterUrl || null, seriesId: seriesId || null,
+      bookBase, updatedAt: Date.now()
     };
     try { localStorage.setItem(LS_KEY_PROGRESS, JSON.stringify(payload)); } catch {}
   }
@@ -260,17 +381,23 @@
     } catch { return null; }
   }
 
+  // ========== 抓取 ==========
   function decodeText(arrayBuffer, headersStr) {
     const lower = (headersStr || '').toLowerCase();
     const m = lower.match(/charset\s*=\s*([^\s;]+)/);
     const fromHeader = m && m[1] ? m[1].replace(/["']/g,'').toLowerCase() : '';
     const tryDec = enc => { try { return new TextDecoder(enc).decode(arrayBuffer); } catch { return null; } };
     let text = null;
-    if (/gbk|gb18030|gb2312/.test(fromHeader)) text = tryDec('gbk') || tryDec('gb18030') || tryDec('utf-8');
-    else text = tryDec('utf-8') || tryDec('gbk') || tryDec('gb18030');
+    if (/big5/.test(fromHeader)) text = tryDec('big5') || tryDec('utf-8');
+    else if (/gbk|gb18030|gb2312/.test(fromHeader)) text = tryDec('gbk') || tryDec('gb18030') || tryDec('utf-8');
+    else text = tryDec('utf-8') || tryDec('gbk') || tryDec('gb18030') || tryDec('big5');
     if (!text) text = String.fromCharCode.apply(null, new Uint8Array(arrayBuffer));
     const hint = (text.match(/<meta[^>]+charset\s*=\s*["']?\s*([a-z0-9-]+)/i) || [])[1];
-    if (hint && /gb/.test(hint.toLowerCase())) text = tryDec('gbk') || tryDec('gb18030') || text;
+    if (hint) {
+      const h = hint.toLowerCase();
+      if (/big5/.test(h)) text = tryDec('big5') || text;
+      else if (/gb/.test(h)) text = tryDec('gbk') || tryDec('gb18030') || text;
+    }
     return text;
   }
 
@@ -296,45 +423,30 @@
 
   const parseHTML = html => new DOMParser().parseFromString(html, 'text/html');
 
-  // ========== 正文抽取 ==========
+  // ========== 正文抽取（走 profile，可回落通用） ==========
   function extractMain(doc, baseUrl) {
-    let node = doc.querySelector('#content')
-             || doc.querySelector('#chaptercontent, #chapterContent, .content, .read-content, #contentTxt, #BookText, #txtContent');
-    if (!node) {
-      const body = doc.body.cloneNode(true);
-      try { body.querySelectorAll('script,style,ins,.adsbygoogle,.ad,.advert,[id^="hm_t_"],.recommend,.toolbar').forEach(e=>e.remove()); } catch {}
-      const txt = (body.textContent || '').trim().replace(/\n{2,}/g,'</p><p>');
-      return txt ? `<p>${txt}</p>` : '<p>（未找到正文容器）</p>';
+    console.log('profile:', state.profile);
+    if (state.profile?.extractContent) {
+      try { return state.profile.extractContent(doc, baseUrl); } catch {}
     }
-    try { node.querySelectorAll('script,style,ins,.adsbygoogle,.ad,.advert,[id^="hm_t_"],.recommend,.toolbar').forEach(e=>e.remove()); } catch {}
-    node.querySelectorAll('img').forEach(img => {
-      const src = img.getAttribute('src') || '';
-      try { img.src = new URL(src, baseUrl).href; } catch { img.src = src; }
-      img.style.maxWidth = '100%';
-    });
-    node.querySelectorAll('a').forEach(a => {
-      const href = safeHref(a.getAttribute('href') || '');
-      if (!href) { a.removeAttribute('href'); return; }
-      try { a.href = new URL(href, baseUrl).href; } catch { a.href = href; }
-      a.rel = 'noreferrer noopener';
-    });
-    return node.innerHTML || '<p>（正文为空）</p>';
+    return preferFirst(doc, [
+      '#content', '#chaptercontent', '#chapterContent', '.content', '.read-content', '#contentTxt', '#BookText', '#txtContent'
+    ], baseUrl);
   }
 
+  // ========== 上下页 & 目录链接 ==========
   function getNavUrls(doc, baseUrl) {
-    const norm = (u)=>u ? absolutize(baseUrl, u) : null;
-    let prev = safeHref(doc.querySelector('#prev_url')?.getAttribute('href') || '');
-    let next = safeHref(doc.querySelector('#next_url')?.getAttribute('href') || '');
-    if (!prev) { const c = Array.from(doc.querySelectorAll('a')).find(a => /上[一页一章]/.test((a.textContent || '').trim())); if (c) prev = safeHref(c.getAttribute('href') || ''); }
-    if (!next) { const anchors = Array.from(doc.querySelectorAll('a')); const c = anchors.reverse().find(a => /下[一页一章]/.test((a.textContent || '').trim())); if (c) next = safeHref(c.getAttribute('href') || ''); }
-    return { prev: prev ? norm(prev) : null, next: next ? norm(next) : null };
+    if (state.profile?.findNav) {
+      try { return state.profile.findNav(doc, baseUrl); } catch {}
+    }
+    return generic.findNav(doc, baseUrl);
   }
 
   function getInfoUrl(doc, baseUrl, entryUrl) {
-    const el = doc.querySelector('#info_url');
-    if (el) return absolutize(baseUrl, el.getAttribute('href') || '');
-    const derived = deriveBookBase(entryUrl);
-    return derived;
+    if (state.profile?.findInfoUrl) {
+      try { return state.profile.findInfoUrl(doc, baseUrl, entryUrl); } catch {}
+    }
+    return generic.findInfoUrl(doc, baseUrl, entryUrl);
   }
 
   // ========== 抓取章节（多页拼合） ==========
@@ -344,6 +456,13 @@
     state.pages = []; state.pageIndex = 0;
     state.seriesId = getSeriesIdFromUrl(entryUrl);
     state.nextChapterUrl = null; state.prevChapterUrl = null;
+    state.profile = chooseProfile(entryUrl);
+
+    const newBase = state.profile.deriveBookBase?.(entryUrl) || generic.deriveBookBase(entryUrl) || null;
+    if (state.bookBase && newBase && state.bookBase !== newBase) {
+      state.tocItems = []; // 切书：清空老目录缓存
+    }
+    state.bookBase = newBase;
 
     renderInfo('正在抓取章节…');
 
@@ -351,10 +470,7 @@
       const first = await gmFetch(entryUrl);
       const firstDoc = parseHTML(first.html);
 
-      // 目录 URL
       state.tocUrl = getInfoUrl(firstDoc, entryUrl, entryUrl);
-
-      // 保存进度（目录 + 当前章节）
       saveProgress({ tocUrl: state.tocUrl, chapterUrl: entryUrl, seriesId: state.seriesId });
 
       const { prev: prev0, next: next0 } = getNavUrls(firstDoc, entryUrl);
@@ -396,29 +512,30 @@
   // ========== 目录抓取与渲染 ==========
   async function openTOC() {
     state.modalOpen = true;
+
+    // 切书校验：目录缓存属于别的书则清空
+    const saved = getSavedProgress?.() || null;
+    const desiredBase = (state.tocUrl ? (state.profile?.deriveBookBase?.(state.tocUrl) || generic.deriveBookBase(state.tocUrl))
+                                      : (saved?.tocUrl ? (state.profile?.deriveBookBase?.(saved.tocUrl) || generic.deriveBookBase(saved.tocUrl))
+                                                       : generic.deriveBookBase(location.href))) || null;
+    const currBase = state.tocItems.length ? generic.deriveBookBase(state.tocItems[0].href) : null;
+    if (currBase && desiredBase && currBase !== desiredBase) state.tocItems = [];
+
     toc.style.display = 'flex';
     $('#cr-toc-goto').value = '';
 
-    // 优先使用记忆目录
     if (!state.tocUrl) {
-      const saved = getSavedProgress();
-      if (saved && saved.tocUrl) state.tocUrl = saved.tocUrl;
+      const sp = getSavedProgress();
+      if (sp && sp.tocUrl) state.tocUrl = sp.tocUrl;
+      else state.tocUrl = state.bookBase || generic.deriveBookBase(location.href);
     }
 
     if (!state.tocItems.length) {
       tocListEl.innerHTML = `<div style="padding:8px;color:#666">正在加载目录…</div>`;
-      let tocUrl = state.tocUrl;
-      if (!tocUrl) {
-        // 若仍无记忆目录，则按当前页推断
-        tocUrl = deriveBookBase(location.href);
-        state.tocUrl = tocUrl;
-      }
       try {
-        const res = await gmFetch(tocUrl);
-        const doc = parseHTML(res.html);
-        const items = collectTOCItems(doc, tocUrl);
-        state.tocItems = items;
-        state.tocPage = clampTocPageToCurrent(items);
+        const ok = await tryFetchTOC(state.tocUrl);
+        if (!ok) throw new Error('未找到目录链接');
+        state.tocPage = clampTocPageToCurrent(state.tocItems);
         renderTOC();
       } catch (e) {
         console.error('[clean-reader] 目录抓取失败：', e);
@@ -431,39 +548,148 @@
     }
   }
 
+  async function tryFetchTOC(tocUrl) {
+    const base = (state.profile?.deriveBookBase?.(tocUrl) || generic.deriveBookBase(tocUrl) || tocUrl).replace(/\/?$/,'/');
+    const candidates = (state.profile?.tocCandidates?.(base)) || [base, base + 'index.html'];
+
+    for (const u of candidates) {
+      try {
+        const res = await gmFetch(u);
+        const doc = parseHTML(res.html);
+        const items = collectTOCItems(doc, u);
+        if (items && items.length) {
+          state.tocUrl = (state.profile?.deriveBookBase?.(u) || generic.deriveBookBase(u) || u);
+          state.tocItems = items;
+          return true;
+        }
+      } catch {}
+    }
+    return false;
+  }
+
   function clampTocPageToCurrent(items) {
     const idx = items.findIndex(it => it.id && state.seriesId && it.id === state.seriesId);
     if (idx < 0) return state.tocPage || 0;
     return Math.floor(idx / state.tocPageSize);
   }
 
-  function closeTOC() {
-    state.modalOpen = false;
-    toc.style.display = 'none';
-  }
+  function closeTOC() { state.modalOpen = false; toc.style.display = 'none'; }
 
   function collectTOCItems(doc, baseUrl) {
-    const bookBase = deriveBookBase(baseUrl) || '';
-    const anchors = Array.from(doc.querySelectorAll('a'));
+    const bookBase = (state.profile?.deriveBookBase?.(baseUrl) || generic.deriveBookBase(baseUrl) || '').replace(/\/?$/,'/');
+    const isChapterLink = (abs) => (state.profile?.isChapterLink?.(abs, bookBase)) ?? (sameBook(abs, bookBase) && /\/\d+(?:_\d+)?\.html(?:[#?].*)?$/i.test(abs));
+
+    // 1) 优先从 profile 指定容器搜
+    const containersSel = state.profile?.tocContainers || [];
+    const containerEls = containersSel.map(sel => doc.querySelector(sel)).filter(Boolean);
+
+    let anchors = [];
+    for (const c of containerEls) anchors.push(...c.querySelectorAll('a'));
+    // 2) 容器里没拿到就全局兜底
+    if (anchors.length === 0) anchors = Array.from(doc.querySelectorAll('a'));
+
     const out = [];
     const seen = new Set();
 
-    anchors.forEach(a => {
+    for (const a of anchors) {
       const raw = safeHref(a.getAttribute('href') || '');
-      if (!raw) return;
+      if (!raw) continue;
       const abs = absolutize(baseUrl, raw);
-      if (!abs.startsWith(bookBase)) return;
-      if (!/\/\d+(?:_\d+)?\.html(?:[#?].*)?$/.test(abs)) return;
-      if (seen.has(abs)) return;
+      if (!isChapterLink(abs)) continue;
+      if (seen.has(abs)) continue;
       seen.add(abs);
-      const title = (a.textContent || a.getAttribute('title') || '').trim().replace(/\s+/g,' ');
+      const title = (a.textContent || a.getAttribute('title') || '').trim().replace(/\s+/g, ' ');
       const id = chapterIdFromHref(abs);
       out.push({ title: title || (id ? `章节 ${id}` : abs), href: abs, id });
-    });
+    }
 
+    // 3) 目录由脚本写入或结构非常规时，正则兜底（biquge.tw 常见）
+    if (out.length < 5) {
+      const html = doc.documentElement.innerHTML || '';
+      const re = /<a[^>]+href=["']([^"']*\/book\/\d+\/\d+(?:_\d+)?\.html)["'][^>]*>([^<]*)<\/a>/ig;
+      let m;
+      while ((m = re.exec(html))) {
+        const abs = absolutize(baseUrl, m[1]);
+        if (!isChapterLink(abs) || seen.has(abs)) continue;
+        seen.add(abs);
+        const id = chapterIdFromHref(abs);
+        const title = (m[2] || '').trim().replace(/\s+/g, ' ');
+        out.push({ title: title || (id ? `章节 ${id}` : abs), href: abs, id });
+      }
+    }
+
+    // 4) 过滤噪声项
     const blacklist = /(上一[页章]|下一[页章]|返回|顶|底|最新|目录)/;
     return out.filter(it => !blacklist.test(it.title));
   }
+
+  // ========== 渲染 ==========
+  function renderInfo(msg) { contentEl.innerHTML = `<div style="color:#666;font-size:12px">${msg}</div>`; }
+  function showCurrentPage() {
+    const idx = state.pageIndex;
+    if (!state.pages[idx]) return;
+    const total = state.pages.length;
+    contentEl.innerHTML = `
+      <div style="color:#666; font-size:12px; margin-bottom:8px;">第 ${idx+1}/${total} 页 · ←/→ 翻页，↑/↓ 滚动</div>
+      <div>${state.pages[idx].html}</div>
+    `;
+    contentEl.scrollTop = 0;
+  }
+
+  // ========== 面板显示/隐藏 ==========
+  function showPanel(){ state.visible = true; panel.style.display = 'block'; restorePanelState(); clampIntoViewport(); }
+  function hidePanel(){ state.visible = false; panel.style.display = 'none'; }
+  function togglePanel(){ state.visible ? hidePanel() : showPanel(); }
+
+  // ========== URL 弹窗 ==========
+  function openUrlModal(defaultUrl) {
+    state.modalOpen = true; showPanel(); modal.style.display = 'flex';
+    const saved = getSavedProgress();
+    urlInput.value = (saved && saved.chapterUrl) || defaultUrl || location.href;
+    urlInput.focus(); urlInput.select();
+  }
+  function closeUrlModal() { state.modalOpen = false; modal.style.display = 'none'; }
+
+  $('#cr-cancel', modal).addEventListener('click', closeUrlModal);
+  $('#cr-confirm', modal).addEventListener('click', () => {
+    const u = urlInput.value.trim();
+    if (!u) return;
+    closeUrlModal();
+    fetchChapterSeries(u);
+  });
+  urlInput.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('#cr-confirm', modal).click(); }
+    if (e.key === 'Escape') { e.preventDefault(); closeUrlModal(); }
+  });
+
+  // ========== 目录弹窗事件 ==========
+  $('#cr-toc-close', toc).addEventListener('click', closeTOC);
+  $('#cr-toc-prev', toc).addEventListener('click', () => { state.tocPage = Math.max(0, state.tocPage - 1); renderTOC(); });
+  $('#cr-toc-next', toc).addEventListener('click', () => {
+    const total = state.tocItems.length;
+    const maxPage = Math.max(0, Math.ceil(total / state.tocPageSize) - 1);
+    state.tocPage = Math.min(maxPage, state.tocPage + 1);
+    renderTOC();
+  });
+  $('#cr-toc-go', toc).addEventListener('click', () => {
+    const total = state.tocItems.length;
+    const maxPage = Math.max(1, Math.ceil(total / state.tocPageSize));
+    let p = parseInt(tocGotoEl.value, 10);
+    if (!isFinite(p) || p < 1) p = 1;
+    if (p > maxPage) p = maxPage;
+    state.tocPage = p - 1;
+    renderTOC();
+  });
+  tocGotoEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); $('#cr-toc-go', toc).click(); }
+    if (e.key === 'Escape') { e.preventDefault(); closeTOC(); }
+  });
+  toc.addEventListener('keydown', (e) => {
+    if (!state.modalOpen) return;
+    if (e.key === 'PageDown') { e.preventDefault(); $('#cr-toc-next', toc).click(); }
+    if (e.key === 'PageUp')   { e.preventDefault(); $('#cr-toc-prev', toc).click(); }
+    if (e.key === 'Escape')   { e.preventDefault(); closeTOC(); }
+  });
 
   function renderTOC() {
     const total = state.tocItems.length;
@@ -494,17 +720,13 @@
       el.addEventListener('click', () => {
         const href = el.getAttribute('data-href');
         if (href) {
-          closeTOC();
-          showPanel();
-          fetchChapterSeries(href);
+          closeTOC(); showPanel(); fetchChapterSeries(href);
         }
       });
       el.addEventListener('dblclick', () => {
         const href = el.getAttribute('data-href');
         if (href) {
-          closeTOC();
-          showPanel();
-          fetchChapterSeries(href);
+          closeTOC(); showPanel(); fetchChapterSeries(href);
         }
       });
     });
@@ -514,86 +736,7 @@
     return (s || '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
   }
 
-  // ========== 渲染 ==========
-  function renderInfo(msg) { contentEl.innerHTML = `<div style="color:#666;font-size:12px">${msg}</div>`; }
-  function showCurrentPage() {
-    const idx = state.pageIndex;
-    if (!state.pages[idx]) return;
-    const total = state.pages.length;
-    contentEl.innerHTML = `
-      <div style="color:#666; font-size:12px; margin-bottom:8px;">第 ${idx+1}/${total} 页 · ←/→ 翻页，↑/↓ 滚动</div>
-      <div>${state.pages[idx].html}</div>
-    `;
-    contentEl.scrollTop = 0;
-  }
-
-  // ========== 面板显示/隐藏 ==========
-  function showPanel(){
-    state.visible = true; panel.style.display = 'block';
-    restorePanelState(); clampIntoViewport();
-  }
-  function hidePanel(){ state.visible = false; panel.style.display = 'none'; }
-  function togglePanel(){ state.visible ? hidePanel() : showPanel(); }
-
-  // ========== URL 弹窗 ==========
-  function openUrlModal(defaultUrl) {
-    state.modalOpen = true;
-    showPanel();
-    modal.style.display = 'flex';
-
-    // 默认填入「上次章节」> 传入默认 > 当前页
-    const saved = getSavedProgress();
-    urlInput.value = (saved && saved.chapterUrl) || defaultUrl || location.href;
-
-    urlInput.focus(); urlInput.select();
-  }
-  function closeUrlModal() { state.modalOpen = false; modal.style.display = 'none'; }
-
-  $('#cr-cancel', modal).addEventListener('click', closeUrlModal);
-  $('#cr-confirm', modal).addEventListener('click', () => {
-    const u = urlInput.value.trim();
-    if (!u) return;
-    closeUrlModal();
-    fetchChapterSeries(u);
-  });
-  urlInput.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); $('#cr-confirm', modal).click(); }
-    if (e.key === 'Escape') { e.preventDefault(); closeUrlModal(); }
-  });
-
-  // ========== 目录弹窗事件 ==========
-  $('#cr-toc-close', toc).addEventListener('click', closeTOC);
-  $('#cr-toc-prev', toc).addEventListener('click', () => {
-    state.tocPage = Math.max(0, state.tocPage - 1);
-    renderTOC();
-  });
-  $('#cr-toc-next', toc).addEventListener('click', () => {
-    const total = state.tocItems.length;
-    const maxPage = Math.max(0, Math.ceil(total / state.tocPageSize) - 1);
-    state.tocPage = Math.min(maxPage, state.tocPage + 1);
-    renderTOC();
-  });
-  $('#cr-toc-go', toc).addEventListener('click', () => {
-    const total = state.tocItems.length;
-    const maxPage = Math.max(1, Math.ceil(total / state.tocPageSize));
-    let p = parseInt(tocGotoEl.value, 10);
-    if (!isFinite(p) || p < 1) p = 1;
-    if (p > maxPage) p = maxPage;
-    state.tocPage = p - 1;
-    renderTOC();
-  });
-  tocGotoEl.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter') { e.preventDefault(); $('#cr-toc-go', toc).click(); }
-    if (e.key === 'Escape') { e.preventDefault(); closeTOC(); }
-  });
-  toc.addEventListener('keydown', (e) => {
-    if (!state.modalOpen) return;
-    if (e.key === 'PageDown') { e.preventDefault(); $('#cr-toc-next', toc).click(); }
-    if (e.key === 'PageUp')   { e.preventDefault(); $('#cr-toc-prev', toc).click(); }
-    if (e.key === 'Escape')   { e.preventDefault(); closeTOC(); }
-  });
-
-  // ========== 拖动 ==========
+  // ========== 拖动/大小 ==========
   function startDrag(e){
     state.dragging = true;
     const rect = panel.getBoundingClientRect();
@@ -626,7 +769,6 @@
   }
   dragEl.addEventListener('mousedown', startDrag, true);
 
-  // ========== 调整大小 ==========
   function startResize(e){
     state.resizing = true;
     const rect = panel.getBoundingClientRect();
@@ -664,14 +806,11 @@
   }
   resizeEl.addEventListener('mousedown', startResize, true);
 
-  // ========== 键盘捕获（仅面板可见且无弹窗时） ==========
+  // ========== 键盘捕获 ==========
   const SCROLL_STEP = 80;
   function handleKey(e) {
-    // Alt+L：输入链接
     if (e.altKey && (e.key === 'l' || e.key === 'L')) { e.preventDefault(); e.stopPropagation(); openUrlModal(location.href); return; }
-    // Alt+T：目录（优先使用记忆目录）
     if (e.altKey && (e.key === 't' || e.key === 'T')) { e.preventDefault(); e.stopPropagation(); openTOC(); return; }
-    // Alt+R：续读上次章节
     if (e.altKey && (e.key === 'r' || e.key === 'R')) {
       e.preventDefault(); e.stopPropagation();
       const saved = getSavedProgress();
@@ -679,14 +818,12 @@
       else { openUrlModal(location.href); }
       return;
     }
-    // Ctrl+Alt+X：显示/隐藏面板
     if (e.ctrlKey && e.altKey && (e.key === 'x' || e.key === 'X')) { e.preventDefault(); e.stopPropagation(); togglePanel(); return; }
 
     if (state.modalOpen) return;
     if (!state.visible) return;
     if (!['ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.key)) return;
 
-    // 捕获方向键
     e.preventDefault(); e.stopImmediatePropagation(); e.stopPropagation();
 
     if (e.key === 'ArrowUp') {
@@ -721,6 +858,5 @@
   // ========== 辅助 ==========
   function renderInfo(msg) { contentEl.innerHTML = `<div style="color:#666;font-size:12px">${msg}</div>`; }
 
-  // 首次尝试恢复（面板位置 & 记忆目录仅在使用时读取）
   restorePanelState();
 })();
